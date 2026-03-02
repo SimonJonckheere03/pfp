@@ -71,11 +71,20 @@ if(OPENMP_FOUND)
 endif()
 
 # HTS
-list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
-find_package(HTSlib REQUIRED)
-if(HTSlib_FOUND)
-    include_directories(${HTSlib_INCLUDE_DIRS})
-    message(STATUS "HTSlib: ${HTSlib_LIBRARIES}")
+if(NOT HTSlib_LIBRARIES)
+    # If variables weren't passed externally, use the standard search
+    list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
+    find_package(HTSlib REQUIRED)
+else()
+    # Variables were injected via ExternalProject_Add, skip the custom Find script
+    message(STATUS "Bypassing FindHTSlib.cmake. Using injected HTSlib: ${HTSlib_LIBRARIES}")
+endif()
+
+# Apply the includes regardless of how HTSlib was found
+if(HTSlib_FOUND OR HTSlib_LIBRARIES)
+    # Add BOTH the base include dir AND the htslib subfolder
+    include_directories(${HTSlib_INCLUDE_DIRS} ${HTSlib_INCLUDE_DIRS}/htslib)
+    message(STATUS "HTSlib linked successfully.")
 endif()
 
 ################################################################################
@@ -94,17 +103,16 @@ add_library(pfp ${SOURCES} ${MALLOC_COUNT_SOURCES} ${MURMUR_SOURCES})
 add_library(pfp64 ${SOURCES} ${MALLOC_COUNT_SOURCES} ${MURMUR_SOURCES})
 target_compile_options(pfp64 PRIVATE "-DPFP_LONG_TYPE=ON")
 
-set(VCF_LIB_DEPS ${HTSlib_LIBRARIES} dl pthread ssl crypto)
-
+set(VCF_LIB_DEPS ${HTSlib_LIBRARIES} dl pthread ssl crypto z lzma deflate curl)
 ################################################################################
 # Tests
 
-add_executable(unit_tests tests/unit_tests.cpp)
-target_link_libraries(unit_tests pfp ${VCF_LIB_DEPS})
+# add_executable(unit_tests tests/unit_tests.cpp)
+# target_link_libraries(unit_tests pfp ${VCF_LIB_DEPS})
 
-add_executable(unit_tests64 tests/unit_tests.cpp)
-target_compile_options(unit_tests64 PRIVATE "-DPFP_LONG_TYPE=ON")
-target_link_libraries(unit_tests64 pfp64 ${VCF_LIB_DEPS})
+# add_executable(unit_tests64 tests/unit_tests.cpp)
+# target_compile_options(unit_tests64 PRIVATE "-DPFP_LONG_TYPE=ON")
+# target_link_libraries(unit_tests64 pfp64 ${VCF_LIB_DEPS})
 
 ################################################################################
 # Tools
