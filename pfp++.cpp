@@ -106,26 +106,26 @@ int main(int argc, char **argv)
 
         // Create a dictionary common to all references
         vcfbwt::pfp::Dictionary dictionary;
+        vcfbwt::pfp::Dictionary dictionary_rev; // NEW: Create reverse dictionary
 
         // Parse all references
-        
         std::vector<vcfbwt::pfp::ReferenceParse> references_parse;
-        
         auto& references = vcf.get_references();
         auto& references_name = vcf.get_references_name();
         
         references_parse.reserve(references.size());
-        // TODO: This might be parallelized as well
         for (size_t i = 0; i < references.size(); ++i) 
-            references_parse.push_back( std::move( vcfbwt::pfp::ReferenceParse( references[i], references_name[i], dictionary, params, (i==0) ) ) );
+            references_parse.push_back( std::move( vcfbwt::pfp::ReferenceParse( references[i], references_name[i], dictionary, dictionary_rev, params, (i==0) ) ) );
 
-        vcfbwt::pfp::ParserVCF main_parser(params, out_prefix, references_parse, dictionary);
+        // Initialize main parser with BOTH dictionaries
+        vcfbwt::pfp::ParserVCF main_parser(params, out_prefix, references_parse, dictionary, dictionary_rev);
     
         std::vector<vcfbwt::pfp::ParserVCF> workers(threads);
         for (std::size_t i = 0; i < workers.size(); i++)
         {
             std::size_t tag = vcfbwt::pfp::ParserVCF::WORKER | vcfbwt::pfp::ParserVCF::UNCOMPRESSED;
-            workers[i].init(params, "", references_parse, dictionary, tag);
+            // Initialize workers with BOTH dictionaries
+            workers[i].init(params, "", references_parse, dictionary, dictionary_rev, tag);
             main_parser.register_worker(workers[i]);
         }
 

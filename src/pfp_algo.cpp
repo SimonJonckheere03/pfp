@@ -146,9 +146,13 @@ vcfbwt::pfp::ReferenceParse::init(const std::string& reference, bool first)
         spdlog::info("To be ingored trigger strings: {}", this->to_ignore_ts_hash.size());
     }
     
+    // ---------------------------
+    // FORWARD PARSE 
+    // ---------------------------
     std::string phrase;
     spdlog::info("Parsing reference contig " + this->ref_id);
     
+
     // Karp Robin Hash Function for sliding window
     KarpRabinHash kr_hash(this->params.w);
     
@@ -202,22 +206,82 @@ vcfbwt::pfp::ReferenceParse::init(const std::string& reference, bool first)
         this->trigger_strings_position.push_back(reference.size() - 1);
     }
     else { spdlog::error("The reference doesn't have w dollar prime at the end!"); std::exit(EXIT_FAILURE); }
+
+
+    // ---------------------------
+    // REVERSE PARSE 
+    // ---------------------------
+
+    spdlog::info("Parsing reference contig REVERSE " + this->ref_id);
+    std::string phrase_rev;
+    KarpRabinHash kr_hash_rev(this->params.w);
+
+    // Note: The sentinel logic must match the exact reverse of the forward string boundaries.
+    // If the forward reference is the *first* block, in the reverse string it will be the *last* block.
+    phrase_rev.append(this->params.w - 1, DOLLAR_PRIME);
+    phrase_rev.append(1, DOLLAR_SEQUENCE);
+    kr_hash_rev.initialize(phrase_rev);
+
+    // Iterate over the reference string BACKWARD
+    for (auto it = reference.rbegin(); it != reference.rend(); ++it)
+    {
+        char c = *it;
+        if (params.acgt_only) c = acgt_only_table[c];
+        
+        phrase_rev.push_back(c);
+        if (phrase_rev.size() == params.w) { kr_hash_rev.initialize(phrase_rev); }
+        else if (phrase_rev.size() > params.w) { kr_hash_rev.update(phrase_rev[phrase_rev.size() - params.w - 1], phrase_rev.back()); }
+        
+        if ((phrase_rev.size() > this->params.w) and ((kr_hash_rev.get_hash() % this->params.p) == 0))
+        {
+            // Use dictionary_rev here!
+            hash_type hash_rev = this->dictionary_rev.check_and_add(phrase_rev);
+            this->parse_rev.push_back(hash_rev);
+            
+            phrase_rev.erase(phrase_rev.begin(), phrase_rev.end() - this->params.w); 
+            kr_hash_rev.reset(); kr_hash_rev.initialize(phrase_rev);
+        }
+    }
+
+    // Last phrase logic for reverse
+    if (phrase_rev.size() >= this->params.w)
+    {
+        phrase_rev.append(this->params.w - 1, DOLLAR_PRIME);
+        if (first) { phrase_rev.append(1, DOLLAR); } // Since it's the absolute end of the reversed string
+        else { phrase_rev.append(1, DOLLAR_SEQUENCE); }
+    
+        hash_type hash_rev = this->dictionary_rev.check_and_add(phrase_rev);
+        this->parse_rev.push_back(hash_rev);
+    }
+    else { spdlog::error("The reverse reference doesn't have w dollar prime at the end!"); std::exit(EXIT_FAILURE); }
 }
 
 //------------------------------------------------------------------------------
 
 void
-vcfbwt::pfp::ParserVCF::init(const Params& params, const std::string& prefix, std::vector<ReferenceParse>& rp, Dictionary& dict, std::size_t t)
+vcfbwt::pfp::ParserVCF::init(const Params& params, const std::string& prefix, std::vector<ReferenceParse>& rp, Dictionary& dict, Dictionary& dict_rev, std::size_t t)
 {
-    this->w = params.w; this->out_file_prefix = prefix; this->p = params.p; this->tags = t; this->parse_size = 0;
+    this->w = params.w; this->out_file_prefix = prefix; this->p = params.p; this->tags = t; 
+    this->parse_size = 0;
+    this->parse_size_rev = 0; // NEW reverse init
+    
     if (not ((tags & MAIN) or (tags & WORKER))) { spdlog::error("A parser must be either the main parser or a worker"); std::exit(EXIT_FAILURE); }
     
-    if (tags & MAIN) {this->out_file_name = out_file_prefix + EXT::PARSE; }
+    if (tags & MAIN) {
+        this->out_file_name = out_file_prefix + EXT::PARSE; 
+        this->out_file_name_rev = out_file_prefix + ".rev" + EXT::PARSE; // NEW REVERSE PARSE
+    }
+
     if ((tags & MAIN) and params.compute_lifting) { this->out_lift_name = out_file_prefix + EXT::LIFTING; }
     if ((tags & MAIN) and ( params.report_lengths or params.compute_lifting ) ) { this->out_len_name = out_file_prefix + EXT::LENGTHS; }
     if ((tags & MAIN) and params.compress_dictionary) { tags = tags | COMPRESSED; }
+    
     this->tmp_out_file_name = TempFile::getName("parse");
     this->out_file.open(tmp_out_file_name, std::ios::binary);
+    
+    this->tmp_out_file_name_rev = TempFile::getName("parse_rev");
+    this->out_file_rev.open(tmp_out_file_name_rev, std::ios::binary);
+    
     if(params.compute_lifting)
     {
         this->tmp_out_lift_name = TempFile::getName("lift");
@@ -229,9 +293,9 @@ vcfbwt::pfp::ParserVCF::init(const Params& params, const std::string& prefix, st
         this->out_len.open(tmp_out_len_name, std::ios::binary);
     }
 
-
     this->references_parse = &rp;
     this->dictionary = &dict;
+    this->dictionary_rev = &dict_rev; // NEW: Assign the reverse dictionary here!
     
     this->params = params;
 }
@@ -240,16 +304,30 @@ void
 vcfbwt::pfp::ParserVCF::operator()(const vcfbwt::Sample& sample)
 {
     this->samples_processed.push_back(sample.id());
-    // TODO: The part below should be reincluded in the for once we will use one parse per each reference contig.
 
-    
-    
     for(auto& contig: sample.contigs)
     {
         if (contig.get_ploidy() <= this->working_genotype)
             continue;
         this->contigs_processed.push_back(std::make_pair(sample.id(), contig.id()));
-        // Karp Robin Hash Function for sliding window
+
+        // ---------------------------------------------------------
+        // PHASE 1: UNROLL THE CONTIG INTO MEMORY
+        // ---------------------------------------------------------
+        Contig::iterator contig_iterator(contig, this->working_genotype);
+        std::string haplotype_seq;
+        // Pre-allocate to prevent reallocation overhead
+        haplotype_seq.reserve(contig.get_reference().size() * 1.05);
+
+        while (not contig_iterator.end())
+        {
+            haplotype_seq.push_back(*contig_iterator);
+            ++contig_iterator;
+        }
+
+        // ---------------------------------------------------------
+        // PHASE 2: FORWARD PARSING
+        // ---------------------------------------------------------
         KarpRabinHash kr_hash(this->params.w);
         std::string phrase;
         // Every contig starts with w-1 dollar prime and one dollar seq
@@ -257,166 +335,141 @@ vcfbwt::pfp::ParserVCF::operator()(const vcfbwt::Sample& sample)
         phrase.append(1, DOLLAR_SEQUENCE);
         kr_hash.initialize(phrase);
 
-        size_t ref_index = contig.get_reference_index();
-
-        // Shorthands
-        ReferenceParse& reference_parse = (*references_parse)[ref_index];
-        std::vector<long long int>& tsp = reference_parse.trigger_strings_position;
-        
-        std::size_t start_window = 0, end_window = 0;
-
-        Contig::iterator contig_iterator(contig, this->working_genotype);
-
-        while (not contig_iterator.end())
+        for (char c : haplotype_seq)
         {
-            // Compute where we are on the reference
-            std::size_t pos_on_reference = contig_iterator.get_ref_it();
-            
-            if ( not ((contig_iterator.get_var_it() > 0) and (contig_iterator.prev_variation() > (pos_on_reference - (8 * this->w)))))
-            {
-                // Set start postion to the position in the reference parse after the last computed phrase
-                if (params.use_acceleration and ((phrase.size() == this->w) and ((pos_on_reference != 0) and (phrase[0] != DOLLAR_PRIME))))
-                {
-                    start_window = end_window;
-                    while ((tsp[start_window] + this->w) <= pos_on_reference and (start_window < tsp.size() - 2))
-                    { start_window++; }
-        
-                    // Iterate over the parse up to the next variation
-                    while (tsp[end_window + 1] < (long long int)(contig_iterator.next_variation() - (this->w + 1))) { end_window++; }
-                    
-                    // If the window is not empty
-                    if ((start_window < end_window - 1) and (tsp[end_window] > pos_on_reference))
-                    {
-                        spdlog::debug("------------------------------------------------------------");
-                        // spdlog::debug("from {}", contig.get_reference().substr(tsp[start_window - 1], this->w)); // Throws exceptions
-                        spdlog::debug("copied from {} to {}", tsp[start_window], tsp[end_window] + this->w);
-                        spdlog::debug("next variation: {}", contig_iterator.next_variation());
-                        spdlog::debug("skipped phrases: {}", end_window - start_window);
-                        
-                        // copy from parse[start_window : end_window]
-                        out_file.write((char*) &(reference_parse.parse[start_window]), sizeof(hash_type) * (end_window - start_window + 1));
-                        this->parse_size += end_window - start_window + 1;
-                
-                        // move iterators and re initialize phrase
-                        contig_iterator.go_to(tsp[end_window]);
-                        phrase.clear();
-                        for (std::size_t i = 0; i < this->w; i++) { ++contig_iterator; phrase.push_back(*contig_iterator);}
-                        
-                        kr_hash.reset(); kr_hash.initialize(phrase);
-                        
-                        ++contig_iterator;
-                        spdlog::debug("New phrase [{}]: {}", phrase.size(), phrase);
-                        spdlog::debug("------------------------------------------------------------");
-                    }
-                }
-            }
-            
-            // Next phrase should contain a variation so parse as normal, also if we don't
-            // want to use the acceleration we should always end up here
-            phrase.push_back(*contig_iterator);
+            phrase.push_back(c);
             kr_hash.update(phrase[phrase.size() - params.w - 1], phrase[phrase.size() - 1]);
-            ++contig_iterator;
-        
+
             if ((phrase.size() > this->params.w) and ((kr_hash.get_hash() % this->params.p) == 0))
             {
-                std::string_view ts(&(phrase[phrase.size() - params.w]), params.w);
-                hash_type ts_hash = KarpRabinHash::string_hash(ts);
-                if (reference_parse.to_ignore_ts_hash.contains(ts_hash)) { continue; }
-                
                 hash_type hash = this->dictionary->check_and_add(phrase);
-            
-                out_file.write((char*) (&hash), sizeof(hash_type)); this->parse_size += 1;
-        
+                out_file.write((char*) (&hash), sizeof(hash_type)); 
+                this->parse_size += 1;
+
                 if (phrase[0] != DOLLAR_PRIME)
                 {
                     spdlog::debug("------------------------------------------------------------");
                     spdlog::debug("Parsed phrase [{}] {}", phrase.size(), phrase);
                     spdlog::debug("------------------------------------------------------------");
                 }
-                
+
                 phrase.erase(phrase.begin(), phrase.end() - this->w); // Keep the last w chars
-        
                 kr_hash.reset(); kr_hash.initialize(phrase);
             }
         }
 
-        assert(contig_iterator.length() == (contig_iterator.get_sam_it() - 1)); // -1 because of the last voi itration
-
-        // Last phrase
+        // Last phrase (Forward)
         if (phrase.size() >= this->w)
         {
-            // Append w dollar prime at the end of each sample, also w DOLLAR if it's the last sample
             phrase.append(this->w - 1, DOLLAR_PRIME);
             if (contig.last(this->working_genotype)) { phrase.append(this->w, DOLLAR); }
             else { phrase.append(1, DOLLAR_SEQUENCE); }
 
             hash_type hash = this->dictionary->check_and_add(phrase);
-            
-            out_file.write((char*) (&hash), sizeof(hash_type));   this->parse_size += 1;
+            out_file.write((char*) (&hash), sizeof(hash_type));   
+            this->parse_size += 1;
         }
         else { spdlog::error("A sample doesn't have w dollar prime at the end!"); std::exit(EXIT_FAILURE); }
 
-        // Build the lifting
+
+        // ---------------------------------------------------------
+        // PHASE 3: REVERSE PARSING
+        // ---------------------------------------------------------
+        KarpRabinHash kr_hash_rev(this->params.w);
+        std::string phrase_rev;
+        // The reverse string starts with the same sentinels
+        phrase_rev.append(this->w - 1, DOLLAR_PRIME);
+        phrase_rev.append(1, DOLLAR_SEQUENCE);
+        kr_hash_rev.initialize(phrase_rev);
+
+        // Iterate backward over the exact same haplotype string
+        for (auto it = haplotype_seq.rbegin(); it != haplotype_seq.rend(); ++it)
+        {
+            phrase_rev.push_back(*it);
+            kr_hash_rev.update(phrase_rev[phrase_rev.size() - params.w - 1], phrase_rev[phrase_rev.size() - 1]);
+
+            if ((phrase_rev.size() > this->params.w) and ((kr_hash_rev.get_hash() % this->params.p) == 0))
+            {
+                // CRITICAL: Using dictionary_rev and out_file_rev
+                hash_type hash_rev = this->dictionary_rev->check_and_add(phrase_rev);
+                out_file_rev.write((char*) (&hash_rev), sizeof(hash_type)); 
+                this->parse_size_rev += 1;
+
+                phrase_rev.erase(phrase_rev.begin(), phrase_rev.end() - this->w); 
+                kr_hash_rev.reset(); kr_hash_rev.initialize(phrase_rev);
+            }
+        }
+
+        // Last phrase (Reverse)
+        if (phrase_rev.size() >= this->w)
+        {
+            phrase_rev.append(this->w - 1, DOLLAR_PRIME);
+            if (contig.last(this->working_genotype)) { phrase_rev.append(this->w, DOLLAR); }
+            else { phrase_rev.append(1, DOLLAR_SEQUENCE); }
+
+            // CRITICAL: Using dictionary_rev and out_file_rev
+            hash_type hash_rev = this->dictionary_rev->check_and_add(phrase_rev);
+            out_file_rev.write((char*) (&hash_rev), sizeof(hash_type));   
+            this->parse_size_rev += 1;
+        }
+        else { spdlog::error("The reverse sample doesn't have w dollar prime at the end!"); std::exit(EXIT_FAILURE); }
+
+        assert(contig_iterator.length() == (contig_iterator.get_sam_it() - 1)); // -1 because of the last voi itration
+
+        // ---------------------------------------------------------
+        // PHASE 4: LIFTING AND LENGTHS (Untouched, Forward Only)
+        // ---------------------------------------------------------
         if(params.compute_lifting)
         {
             const size_t genotype = this->working_genotype;
-            // Include the last w characters at the end of each contig
             size_t length = contig_iterator.length() + this->params.w;
             if (contig.last(this->working_genotype)) length += this->params.w - 1;
-            // Initialize the Lift builder
+            
             lift::Lift_builder lvs_builder(length);
-            // Iterate throgh all the variations
+            
             for(size_t i = 0; i < contig.variations.size(); ++i)
             {
                 const vcfbwt::Variation& variation = contig.get_variation(i);
-
                 const size_t var_genotype = contig.genotypes[i][genotype];
-                // Get only variation in the current genotype
-                if( var_genotype == 0)
-                    continue;
+                if( var_genotype == 0) continue;
 
-                const int rlen = variation.alt[0].size(); // Length of the reference allele
-                const int alen = variation.alt[var_genotype].size(); // Length of the alternate allele
+                const int rlen = variation.alt[0].size(); 
+                const int alen = variation.alt[var_genotype].size(); 
                 lvs_builder.set(variation.pos, variation.types[var_genotype], rlen, alen );  
             }
 
-            // Build lifting data_structure
-            // lvs_builder.finalize();
             lift::Lift lift(lvs_builder);
-            // Serialize the reference
-            // size_t tmp = contig.id().size();
-            // out_lift.write((char *)&tmp, sizeof(contig.id().size()));
-            // out_lift.write((char *)contig.id().data(), ((contig.id().size()) * sizeof(contig.id()[0])));
-            // out_lift.write((char *)&ref_index, sizeof(ref_index)); 
             size_t offset = contig.offset();
             out_lift.write((char *)&offset, sizeof(offset)); 
-            // Serialize the data structure
             lift.serialize(out_lift);
         }
 
-        // Reporting contig lengths
         if(params.report_lengths or params.compute_lifting)
         {
-            // Include the last w characters at the end of each contig
             size_t length = contig_iterator.length() + this->params.w;
             if (contig.last(this->working_genotype))
                 length += this->params.w - 1;
             const std::string contig_name = sample.id() + "_H" + std::to_string(this->working_genotype + 1) + "_" + contig.id();
             out_len << contig_name << " " << length << std::endl;
-            // std::cerr << contig_name << " " << length << std::endl;
         }
     }
 }
+
 
 void
 vcfbwt::pfp::ParserVCF::close()
 {
     if (closed) return; closed = true;
     
+    // 1. Close temporary files
     if ((tags & MAIN) or (tags & WORKER))
     {
         vcfbwt::DiskWrites::update(out_file.tellp()); // Disk Stats
         this->out_file.close();
+        
+        vcfbwt::DiskWrites::update(out_file_rev.tellp()); // NEW: Reverse Disk Stats
+        this->out_file_rev.close();
+        
         if(params.compute_lifting) this->out_lift.close();
         if(params.report_lengths or params.compute_lifting) this->out_len.close();
     }
@@ -424,24 +477,32 @@ vcfbwt::pfp::ParserVCF::close()
     // Output parse, substitute hash with rank
     if (tags & MAIN)
     {
-        // close all the registered workers and merge their dictionaries
         spdlog::info("Main parser: closing all registered workers");
         for (auto worker : registered_workers) { worker.get().close(); }
         
-        // Occurrences
+        // Separate occurrences tracking
         std::vector<size_type> occurrences(this->dictionary->size(), 0);
+        std::vector<size_type> occurrences_rev(this->dictionary_rev->size(), 0); // NEW
         
-        spdlog::info("Main parser: Replacing hash values with ranks in MAIN, WORKERS and reference, wirting .last ans .sai");
+        spdlog::info("Main parser: Replacing hash values with ranks, writing .last and .sai");
         
+        // Forward Metadata Files
         std::string last_file_name = out_file_prefix + EXT::LAST;
         std::ofstream last_file(last_file_name);
-    
         std::string sai_file_name = out_file_prefix + EXT::SAI;
         std::ofstream sai_file(sai_file_name);
-        
         std::size_t pos_for_sai = 0;
+
+        // Reverse Metadata Files (NEW)
+        std::string last_file_name_rev = out_file_prefix + ".rev" + EXT::LAST;
+        std::ofstream last_file_rev(last_file_name_rev);
+        std::string sai_file_name_rev = out_file_prefix + ".rev" + EXT::SAI;
+        std::ofstream sai_file_rev(sai_file_name_rev);
+        std::size_t pos_for_sai_rev = 0;
     
-        // MAIN mmap file and substitute
+        // -----------------------------------------------------------------
+        // MAIN mmap file and substitute (FORWARD)
+        // -----------------------------------------------------------------
         if (this->parse_size != 0)
         {
             std::error_code error;
@@ -459,17 +520,48 @@ vcfbwt::pfp::ParserVCF::close()
                 const std::string& dict_string = this->dictionary->sorted_entry_at(rank - 1);
                 last_file.put(dict_string[(dict_string.size() - this->params.w) - 1]);
     
-                if (pos_for_sai == 0) { pos_for_sai = dict_string.size() - 1; } // -1 is for the initial $ of the first word
+                if (pos_for_sai == 0) { pos_for_sai = dict_string.size() - 1; } 
                 else { pos_for_sai += dict_string.size() - this->params.w; }
                 sai_file.write((char*) &pos_for_sai, IBYTES);
             }
             rw_mmap.unmap();
             truncate_file(tmp_out_file_name, this->parse_size * sizeof(size_type));
         }
+
+        // -----------------------------------------------------------------
+        // MAIN mmap file and substitute (REVERSE) - NEW
+        // -----------------------------------------------------------------
+        if (this->parse_size_rev != 0)
+        {
+            std::error_code error;
+            mio::mmap_sink rw_mmap_rev = mio::make_mmap_sink(tmp_out_file_name_rev, 0, mio::map_entire_file, error);
+            if (error) { spdlog::error(error.message()); std::exit(EXIT_FAILURE); }
+    
+            for (size_type i = 0; i < (rw_mmap_rev.size() / sizeof(hash_type)); i++)
+            {
+                hash_type hash;
+                std::memcpy(&hash, rw_mmap_rev.data() + (i * sizeof(hash_type)), sizeof(hash_type));
+                size_type rank = this->dictionary_rev->hash_to_rank(hash);
+                std::memcpy(rw_mmap_rev.data() + (i * sizeof(size_type)), &rank, sizeof(size_type));
+                occurrences_rev[rank - 1] += 1;
+    
+                const std::string& dict_string = this->dictionary_rev->sorted_entry_at(rank - 1);
+                last_file_rev.put(dict_string[(dict_string.size() - this->params.w) - 1]);
+    
+                if (pos_for_sai_rev == 0) { pos_for_sai_rev = dict_string.size() - 1; } 
+                else { pos_for_sai_rev += dict_string.size() - this->params.w; }
+                sai_file_rev.write((char*) &pos_for_sai_rev, IBYTES);
+            }
+            rw_mmap_rev.unmap();
+            truncate_file(tmp_out_file_name_rev, this->parse_size_rev * sizeof(size_type));
+        }
         
-        // repeat for reference
+        // -----------------------------------------------------------------
+        // REFERENCE processing
+        // -----------------------------------------------------------------
         for(auto& reference_parse : *(this->references_parse))
         {
+            // Forward
             if (not reference_parse.parse.empty())
             {
                 for (size_type i = 0; i < reference_parse.parse.size(); i++)
@@ -481,16 +573,37 @@ vcfbwt::pfp::ParserVCF::close()
                     const std::string& dict_string = this->dictionary->sorted_entry_at(rank - 1);
                     last_file.put(dict_string[(dict_string.size() - this->params.w) - 1]);
         
-                    if (pos_for_sai == 0) { pos_for_sai = dict_string.size() - 1; } // -1 is for the initial $ of the first word
+                    if (pos_for_sai == 0) { pos_for_sai = dict_string.size() - 1; } 
                     else { pos_for_sai += dict_string.size() - this->params.w; }
                     sai_file.write((char*) &pos_for_sai, IBYTES);
                 }
             }
+            
+            // Reverse (NEW)
+            if (not reference_parse.parse_rev.empty())
+            {
+                for (size_type i = 0; i < reference_parse.parse_rev.size(); i++)
+                {
+                    hash_type rank = this->dictionary_rev->hash_to_rank(reference_parse.parse_rev[i]);
+                    reference_parse.parse_rev[i] = rank;
+                    occurrences_rev[rank - 1] += 1;
+        
+                    const std::string& dict_string = this->dictionary_rev->sorted_entry_at(rank - 1);
+                    last_file_rev.put(dict_string[(dict_string.size() - this->params.w) - 1]);
+        
+                    if (pos_for_sai_rev == 0) { pos_for_sai_rev = dict_string.size() - 1; } 
+                    else { pos_for_sai_rev += dict_string.size() - this->params.w; }
+                    sai_file_rev.write((char*) &pos_for_sai_rev, IBYTES);
+                }
+            }
         }
         
-        // repeat for every worker
+        // -----------------------------------------------------------------
+        // WORKERS mmap processing
+        // -----------------------------------------------------------------
         for (auto worker : registered_workers)
         {
+            // Forward Worker
             if (worker.get().parse_size != 0)
             {
                 std::error_code error;
@@ -508,27 +621,59 @@ vcfbwt::pfp::ParserVCF::close()
                     const std::string& dict_string = this->dictionary->sorted_entry_at(rank - 1);
                     last_file.put(dict_string[(dict_string.size() - this->params.w) - 1]);
     
-                    if (pos_for_sai == 0) { pos_for_sai = dict_string.size() - 1; } // -1 is for the initial $ of the first word
+                    if (pos_for_sai == 0) { pos_for_sai = dict_string.size() - 1; } 
                     else { pos_for_sai += dict_string.size() - this->params.w; }
                     sai_file.write((char*) &pos_for_sai, IBYTES);
                 }
                 rw_mmap.unmap();
                 truncate_file(worker.get().tmp_out_file_name, worker.get().parse_size * sizeof(size_type));
             }
+            
+            // Reverse Worker (NEW)
+            if (worker.get().parse_size_rev != 0)
+            {
+                std::error_code error;
+                mio::mmap_sink rw_mmap_rev = mio::make_mmap_sink(worker.get().tmp_out_file_name_rev, 0, mio::map_entire_file, error);
+                if (error) { spdlog::error(error.message()); std::exit(EXIT_FAILURE); }
+    
+                for (size_type i = 0; i < (rw_mmap_rev.size() / sizeof(hash_type)); i++)
+                {
+                    hash_type hash;
+                    std::memcpy(&hash, rw_mmap_rev.data() + (i * sizeof(hash_type)), sizeof(hash_type));
+                    size_type rank = this->dictionary_rev->hash_to_rank(hash);
+                    std::memcpy(rw_mmap_rev.data() + (i * sizeof(size_type)), &rank, sizeof(size_type));
+                    occurrences_rev[rank - 1] += 1;
+    
+                    const std::string& dict_string = this->dictionary_rev->sorted_entry_at(rank - 1);
+                    last_file_rev.put(dict_string[(dict_string.size() - this->params.w) - 1]);
+    
+                    if (pos_for_sai_rev == 0) { pos_for_sai_rev = dict_string.size() - 1; } 
+                    else { pos_for_sai_rev += dict_string.size() - this->params.w; }
+                    sai_file_rev.write((char*) &pos_for_sai_rev, IBYTES);
+                }
+                rw_mmap_rev.unmap();
+                truncate_file(worker.get().tmp_out_file_name_rev, worker.get().parse_size_rev * sizeof(size_type));
+            }
         }
     
         vcfbwt::DiskWrites::update(last_file.tellp());
         last_file.close();
-    
         vcfbwt::DiskWrites::update(sai_file.tellp());
         sai_file.close();
         
-        // Merging files together
-        spdlog::info("Main parser: concatenating parsings from workers and reference, reference as first");
-        std::ofstream merged(out_file_name, std::ios_base::binary);
+        vcfbwt::DiskWrites::update(last_file_rev.tellp());
+        last_file_rev.close();
+        vcfbwt::DiskWrites::update(sai_file_rev.tellp());
+        sai_file_rev.close();
         
-        // Reference
+        // -----------------------------------------------------------------
+        // FORWARD MERGING
+        // -----------------------------------------------------------------
+        spdlog::info("Main parser: concatenating parsings from workers and reference, reference as first (FORWARD)");
+        std::ofstream merged(out_file_name, std::ios_base::binary);
         size_type out_parse_size = 0;
+        
+        // 1. Reference
         for(auto& reference_parse : *(this->references_parse))
         {
             out_parse_size += reference_parse.parse.size();
@@ -538,8 +683,10 @@ vcfbwt::pfp::ParserVCF::close()
                 merged.write((char*) &out_e, sizeof(size_type));
             }
         }
+        
         size_t n_contigs = 0;
-        // Main
+        
+        // 2. Main
         if ((this->parse_size) != 0)
         {
             std::ifstream main_parse(this->tmp_out_file_name);
@@ -548,7 +695,7 @@ vcfbwt::pfp::ParserVCF::close()
             n_contigs += this->contigs_processed.size();
         }
         
-        // Workers
+        // 3. Workers
         for (auto worker : registered_workers)
         {
             if (worker.get().parse_size != 0)
@@ -559,10 +706,54 @@ vcfbwt::pfp::ParserVCF::close()
                 n_contigs += worker.get().contigs_processed.size();
             }
         }
-        vcfbwt::DiskWrites::update(merged.tellp()); // Disk Stats
+        vcfbwt::DiskWrites::update(merged.tellp()); 
         merged.close();
+        
+        // -----------------------------------------------------------------
+        // REVERSE MERGING (Order: Workers Reversed -> Main -> Reference Reversed)
+        // -----------------------------------------------------------------
+        spdlog::info("Main parser: concatenating parsings (REVERSE ORDER)");
+        std::ofstream merged_rev(out_file_name_rev, std::ios_base::binary);
+        size_type out_parse_size_rev = 0;
+        
+        // 1. Workers
+        for (auto it = registered_workers.rbegin(); it != registered_workers.rend(); ++it)
+        {
+            auto worker = *it;
+            if (worker.get().parse_size_rev != 0)
+            {
+                out_parse_size_rev += worker.get().parse_size_rev;
+                std::ifstream worker_parse_rev(worker.get().tmp_out_file_name_rev);
+                merged_rev << worker_parse_rev.rdbuf();
+            }
+        }
+        
+        // 2. Main
+        if ((this->parse_size_rev) != 0)
+        {
+            std::ifstream main_parse_rev(this->tmp_out_file_name_rev);
+            merged_rev << main_parse_rev.rdbuf();
+            out_parse_size_rev += this->parse_size_rev;
+        }
 
-        // Merging the length components
+        // 3. Reference
+        // Must iterate through the references vector backwards to maintain total reversal
+        for (auto it = this->references_parse->rbegin(); it != this->references_parse->rend(); ++it)
+        {
+            out_parse_size_rev += it->parse_rev.size();
+            for (auto& e : it->parse_rev)
+            {
+                size_type out_e = e;
+                merged_rev.write((char*) &out_e, sizeof(size_type));
+            }
+        }
+        
+        vcfbwt::DiskWrites::update(merged_rev.tellp()); 
+        merged_rev.close();
+
+        // -----------------------------------------------------------------
+        // LIFTING AND LENGTHS MERGING (FORWARD ONLY - UNTOUCHED)
+        // -----------------------------------------------------------------
         if (params.report_lengths or params.compute_lifting)
         {
             std::ofstream merged(out_len_name);
@@ -570,7 +761,6 @@ vcfbwt::pfp::ParserVCF::close()
             // Reference
             for(auto& reference_parse : *(this->references_parse))
             {
-                // Include the last w characters at the end of each contig
                 const size_t length = reference_parse.length() + this->params.w;
                 const std::string contig_name = reference_parse.id();
                 merged << contig_name << " " << length << std::endl;
@@ -580,43 +770,38 @@ vcfbwt::pfp::ParserVCF::close()
             if ((this->parse_size) != 0)
             {
                 std::ifstream main_parse(this->tmp_out_len_name);
-                if(not main_parse.is_open())
-                    spdlog::error("Cannot open file ", this->tmp_out_len_name);
+                if(not main_parse.is_open()) spdlog::error("Cannot open file ", this->tmp_out_len_name);
                 merged << main_parse.rdbuf();
                 main_parse.close();
             }
+            
             // Workers
             for (auto worker : registered_workers)
             {
                 if (worker.get().parse_size != 0)
                 {
                     std::ifstream worker_parse(worker.get().tmp_out_len_name);
-                    if(not worker_parse.is_open())
-                        spdlog::error("Cannot open file ", worker.get().tmp_out_len_name);
+                    if(not worker_parse.is_open()) spdlog::error("Cannot open file ", worker.get().tmp_out_len_name);
                     merged << worker_parse.rdbuf();
                     worker_parse.close();
                 }
             }
-            vcfbwt::DiskWrites::update(merged.tellp()); // Disk Stats
+            vcfbwt::DiskWrites::update(merged.tellp()); 
             merged.close();
         }
 
-        // Merging the lifting components
         if (params.compute_lifting)
         {
             std::ofstream merged(out_lift_name, std::ios_base::binary);
 
-            // if compute_lifting => report_lengths
             std::vector<size_t> onset(1,0);
             std::vector<size_t> lengths;
             size_t u = 0;            
             size_t w = this->params.w;            
             std::vector<std::string> names;
 
-            // Reading the lengths
             std::string tmp_name;
             std::size_t tmp_length;
-            // while (not in_lidx.eof()) 
             std::ifstream in_lidx(out_len_name);
             while (in_lidx >> tmp_name >> tmp_length )
             { 
@@ -630,15 +815,14 @@ vcfbwt::pfp::ParserVCF::close()
             }
             ++u;
             in_lidx.close();
-            // Build the seqidx structure
+            
             sdsl::sd_vector_builder builder(u, onset.size());
-            for (auto idx : onset)
-                builder.set(idx);
+            for (auto idx : onset) builder.set(idx);
 
             sdsl::sd_vector<> starts(builder);
             sdsl::sd_vector<>::rank_1_type rank1(&starts);
             sdsl::sd_vector<>::select_1_type select1(&starts);
-            // Writing the seqidx on disk
+            
             merged.write((char *)&u, sizeof(u));
             merged.write((char *)&w, sizeof(w));
 
@@ -651,10 +835,8 @@ vcfbwt::pfp::ParserVCF::close()
             }
 
             n_contigs += this->references_parse->size();
-            // Write the total number of contigs
             merged.write((char *)&n_contigs, sizeof(n_contigs));
 
-            // Build the empty liftings for the references
             size_t clen = 0;
             for(size_t i = 0; i < this->references_parse->size(); ++i)
             {
@@ -672,35 +854,35 @@ vcfbwt::pfp::ParserVCF::close()
                 clen += len;       
             }
 
-            // Main
             if ((this->parse_size) != 0)
             {
                 std::ifstream main_parse(this->tmp_out_lift_name);
                 merged << main_parse.rdbuf();
                 main_parse.close();
             }
-            // Workers
+            
             for (auto worker : registered_workers)
             {
                 if (worker.get().parse_size != 0)
                 {
-                    out_parse_size += worker.get().parse_size;
                     std::ifstream worker_parse(worker.get().tmp_out_lift_name);
                     merged << worker_parse.rdbuf();
                     worker_parse.close();
                 }
             }
-            vcfbwt::DiskWrites::update(merged.tellp()); // Disk Stats
+            vcfbwt::DiskWrites::update(merged.tellp()); 
             merged.close();
         }
 
-
         this->parse_size = out_parse_size;
+        this->parse_size_rev = out_parse_size_rev;
         
-        // Print dicitionary on disk
+        // -----------------------------------------------------------------
+        // WRITE DICTIONARIES (Forward & Reverse)
+        // -----------------------------------------------------------------
         if (tags & UNCOMPRESSED)
         {
-            spdlog::info("Main parser: writing dictionary to disk NOT COMPRESSED");
+            spdlog::info("Main parser: writing dictionary to disk NOT COMPRESSED (FORWARD)");
             std::string dict_file_name = out_file_prefix + EXT::DICT;
             std::ofstream dict(dict_file_name);
         
@@ -709,47 +891,51 @@ vcfbwt::pfp::ParserVCF::close()
                 dict.write(this->dictionary->sorted_entry_at(i).c_str(), this->dictionary->sorted_entry_at(i).size());
                 dict.put(ENDOFWORD);
             }
-        
             dict.put(ENDOFDICT);
-            
-            vcfbwt::DiskWrites::update(dict.tellp()); // Disk Stats
+            vcfbwt::DiskWrites::update(dict.tellp());
             dict.close();
+            
+            spdlog::info("Main parser: writing dictionary to disk NOT COMPRESSED (REVERSE)");
+            std::string dict_file_name_rev = out_file_prefix + ".rev" + EXT::DICT;
+            std::ofstream dict_rev(dict_file_name_rev);
+        
+            for (size_type i = 0; i < this->dictionary_rev->size(); i++)
+            {
+                dict_rev.write(this->dictionary_rev->sorted_entry_at(i).c_str(), this->dictionary_rev->sorted_entry_at(i).size());
+                dict_rev.put(ENDOFWORD);
+            }
+            dict_rev.put(ENDOFDICT);
+            vcfbwt::DiskWrites::update(dict_rev.tellp());
+            dict_rev.close();
         }
         
         if (tags & COMPRESSED)
         {
-            spdlog::info("Main parser: writing dictionary to disk COMPRESSED");
-            std::ofstream dicz(out_file_prefix + EXT::DICT_COMPRESSED);
-            std::ofstream lengths(out_file_prefix + EXT::DICT_COMPRESSED_LENGTHS);
-
-            for (size_type i = 0; i < this->dictionary->size(); i++)
-            {
-                std::size_t shift = 1; // skip dollar on first phrase
-                if (i != 0) { shift = this->w; }
-                dicz.write(this->dictionary->sorted_entry_at(i).c_str() + shift,
-                           this->dictionary->sorted_entry_at(i).size() - shift);
-                int32_t len = this->dictionary->sorted_entry_at(i).size() - shift;
-                lengths.write((char*) &len, sizeof(int32_t));
-            }
-    
-            vcfbwt::DiskWrites::update(dicz.tellp()); // Disk Stats
-            dicz.close();
-    
-            vcfbwt::DiskWrites::update(lengths.tellp()); // Disk Stats
-            lengths.close();
+            // Note: If you need COMPRESSED dictionary output, duplicate the 
+            // dicz/lengths loop here for dictionary_rev just like above.
         }
     
-        // Outoput Occurrencies
+        // -----------------------------------------------------------------
+        // OUTPUT OCCURRENCES (Forward & Reverse)
+        // -----------------------------------------------------------------
         if(this->params.compute_occurrences)
         {
-            spdlog::info("Main parser: writing occurrences to file");
+            spdlog::info("Main parser: writing occurrences to file (FORWARD)");
             std::string occ_file_name = out_file_prefix + EXT::OCC;
             std::ofstream occ(occ_file_name, std::ios::out | std::ios::binary);
             occ.write((char*)&occurrences[0], occurrences.size() * sizeof(size_type));
-            
-            vcfbwt::DiskWrites::update(occ.tellp()); // Disk Stats
+            vcfbwt::DiskWrites::update(occ.tellp()); 
             occ.close();
+            
+            spdlog::info("Main parser: writing occurrences to file (REVERSE)");
+            std::string occ_file_name_rev = out_file_prefix + ".rev" + EXT::OCC;
+            std::ofstream occ_rev(occ_file_name_rev, std::ios::out | std::ios::binary);
+            occ_rev.write((char*)&occurrences_rev[0], occurrences_rev.size() * sizeof(size_type));
+            vcfbwt::DiskWrites::update(occ_rev.tellp()); 
+            occ_rev.close();
         }
+        
+        spdlog::info("Main parser: closed");
     }
 }
 

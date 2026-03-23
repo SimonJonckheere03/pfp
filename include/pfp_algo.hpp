@@ -127,7 +127,10 @@ class ReferenceParse
     const std::string ref_id;
 public :
     Dictionary& dictionary;
+    Dictionary& dictionary_rev;
     std::vector<hash_type> parse;
+    std::vector<hash_type> parse_rev; // NEW reverse parse
+
     std::vector<long long int> trigger_strings_position; // position of first char of each trigger string
     // std::vector<size_type> trigger_strings_position; // position of first char of each trigger string
     std::set<hash_type> to_ignore_ts_hash;
@@ -139,7 +142,7 @@ public :
     
     void init(const std::string& reference, bool first = true);
     
-    ReferenceParse(const std::string& reference, const std::string& id, Dictionary& dict, const Params& pms, bool first = true) : dictionary(dict), params(pms), ref_length(reference.size()), ref_id(id) { this->init(reference, first); }
+    ReferenceParse(const std::string& reference, const std::string& id, Dictionary& dict, Dictionary& dict_rev, const Params& pms, bool first = true) : dictionary(dict), dictionary_rev(dict_rev), params(pms), ref_length(reference.size()), ref_id(id) { this->init(reference, first); }
     const hash_type& operator[](size_type i) const { return this->parse[i]; }
 };
 
@@ -153,6 +156,12 @@ private:
     std::string out_file_prefix;
     std::string out_file_name;
     std::string tmp_out_file_name;
+
+    // Reverse file variables
+    std::ofstream out_file_rev;
+    std::string tmp_out_file_name_rev;
+    std::string out_file_name_rev;
+    size_type parse_size_rev = 0;
 
     std::ofstream out_lift;
     std::string out_lift_prefix;
@@ -172,6 +181,7 @@ private:
     
     std::vector<ReferenceParse>* references_parse = nullptr;
     Dictionary* dictionary = nullptr;
+    Dictionary* dictionary_rev = nullptr; // NEW: The missing reverse dictionary pointer
 
     // Shorthands
     hash_type w, p;
@@ -193,13 +203,14 @@ public:
         UNCOMPRESSED = 8
     };
     
+    // NEW: Updated init signature to accept dict_rev
+    void init(const Params& params, const std::string& out_prefix, std::vector<ReferenceParse>& rp, Dictionary& dict, Dictionary& dict_rev, std::size_t t = MAIN | UNCOMPRESSED);
     
-    void init(const Params& params, const std::string& out_prefix, std::vector<ReferenceParse>& rp, Dictionary& dict, std::size_t t = MAIN | UNCOMPRESSED);
-    
-    ParserVCF(const Params& params, const std::string& out_prefix, std::vector<ReferenceParse>& rp, Dictionary& dict, std::size_t t = MAIN | UNCOMPRESSED)
+    // NEW: Updated constructor signature to accept dict_rev
+    ParserVCF(const Params& params, const std::string& out_prefix, std::vector<ReferenceParse>& rp, Dictionary& dict, Dictionary& dict_rev, std::size_t t = MAIN | UNCOMPRESSED)
     {
-        if (out_prefix.empty()) { this->init(params, "out", rp, dict, t); }
-        else { this->init(params, out_prefix, rp, dict, t); }
+        if (out_prefix.empty()) { this->init(params, "out", rp, dict, dict_rev, t); }
+        else { this->init(params, out_prefix, rp, dict, dict_rev, t); }
     }
     
     ParserVCF() = default;
