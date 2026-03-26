@@ -129,7 +129,7 @@ public :
     Dictionary& dictionary;
     Dictionary& dictionary_rev;
     std::vector<hash_type> parse;
-    std::vector<hash_type> parse_rev; // NEW reverse parse
+    std::string segment_text;
 
     std::vector<long long int> trigger_strings_position; // position of first char of each trigger string
     // std::vector<size_type> trigger_strings_position; // position of first char of each trigger string
@@ -158,8 +158,6 @@ private:
     std::string tmp_out_file_name;
 
     // Reverse file variables
-    std::ofstream out_file_rev;
-    std::string tmp_out_file_name_rev;
     std::string out_file_name_rev;
     size_type parse_size_rev = 0;
 
@@ -173,8 +171,15 @@ private:
     std::string out_len_name;
     std::string tmp_out_len_name;
     
+    struct ReverseSegment
+    {
+        std::string text;
+        const std::set<hash_type>* ignored_trigger_strings = nullptr;
+    };
+
     std::vector<std::string> samples_processed;
     std::vector<std::pair<std::string, std::string>> contigs_processed;
+    std::vector<ReverseSegment> reverse_segments;
     
     Params params;
     Statistics statistics;
@@ -203,10 +208,8 @@ public:
         UNCOMPRESSED = 8
     };
     
-    // NEW: Updated init signature to accept dict_rev
     void init(const Params& params, const std::string& out_prefix, std::vector<ReferenceParse>& rp, Dictionary& dict, Dictionary& dict_rev, std::size_t t = MAIN | UNCOMPRESSED);
     
-    // NEW: Updated constructor signature to accept dict_rev
     ParserVCF(const Params& params, const std::string& out_prefix, std::vector<ReferenceParse>& rp, Dictionary& dict, Dictionary& dict_rev, std::size_t t = MAIN | UNCOMPRESSED)
     {
         if (out_prefix.empty()) { this->init(params, "out", rp, dict, dict_rev, t); }

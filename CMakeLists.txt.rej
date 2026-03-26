@@ -1,0 +1,120 @@
+diff a/CMakeLists.txt b/CMakeLists.txt	(rejected hunks)
+@@ -74,32 +74,86 @@ endif()
+ # HTS
+ list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
+ find_package(ZLIB REQUIRED)
+-find_package(HTSlib REQUIRED)
+-if(HTSlib_FOUND)
+-    include_directories(${HTSlib_INCLUDE_DIRS})
+-    message(STATUS "HTSlib: ${HTSlib_LIBRARIES}")
++
++# Allow parent projects to provide HTSlib explicitly.
++# If not provided, fall back to normal discovery.
++set(HTSlib_INCLUDE_DIRS "${HTSlib_INCLUDE_DIRS}" CACHE PATH "HTSlib include directory")
++set(HTSlib_LIBRARIES "${HTSlib_LIBRARIES}" CACHE FILEPATH "HTSlib library")
++set(HTSlib_INCLUDE_DIR "${HTSlib_INCLUDE_DIR}" CACHE PATH "HTSlib include directory (legacy)")
++set(HTSlib_LIBRARY "${HTSlib_LIBRARY}" CACHE FILEPATH "HTSlib library (legacy)")
++
++if(NOT HTSlib_INCLUDE_DIRS AND HTSlib_INCLUDE_DIR)
++    set(HTSlib_INCLUDE_DIRS "${HTSlib_INCLUDE_DIR}")
++endif()
++if(NOT HTSlib_LIBRARIES AND HTSlib_LIBRARY)
++    set(HTSlib_LIBRARIES "${HTSlib_LIBRARY}")
++endif()
++
++if(HTSlib_INCLUDE_DIRS AND HTSlib_LIBRARIES)
++    message(STATUS "Using caller-provided HTSlib")
++    message(STATUS "HTSlib include dirs: ${HTSlib_INCLUDE_DIRS}")
++    message(STATUS "HTSlib libraries: ${HTSlib_LIBRARIES}")
++else()
++    find_package(HTSlib REQUIRED)
++    message(STATUS "Using discovered HTSlib")
++    message(STATUS "HTSlib include dirs: ${HTSlib_INCLUDE_DIRS}")
++    message(STATUS "HTSlib libraries: ${HTSlib_LIBRARIES}")
+ endif()
+ 
++include_directories(${HTSlib_INCLUDE_DIRS})
+ 
+-find_library(LEVIOSAM_LIB lvsam)
+-if(NOT LEVIOSAM_LIB)
+-    message(STATUS "leviosam library not found. Building as an external content.")
+-    include(FetchContent)
+-    
+-    FetchContent_Declare(
+-        leviosam
+-        GIT_REPOSITORY https://github.com/maxrossi91/levioSAM.git
+-        GIT_TAG master
+-        )
+-        
+-    FetchContent_GetProperties(leviosam)
+-    if(NOT leviosam_POPULATED)
+-        FetchContent_Populate(leviosam)
+-        set(BUILD_TESTS OFF CACHE BOOL "Avoid building LevioSAM tests")
+-
+-        add_subdirectory(${leviosam_SOURCE_DIR} ${leviosam_BINARY_DIR} EXCLUDE_FROM_ALL)
+-        target_include_directories(lvsam PUBLIC ${leviosam_SOURCE_DIR}/src ${CMAKE_INCLUDE_PATH})
+-        target_link_libraries(lvsam INTERFACE ${HTS_LIB} ${SDSL_LIB})
++if(NOT TARGET htslib)
++    add_library(htslib UNKNOWN IMPORTED)
++    set_target_properties(htslib PROPERTIES
++        IMPORTED_LOCATION "${HTSlib_LIBRARIES}"
++        INTERFACE_INCLUDE_DIRECTORIES "${HTSlib_INCLUDE_DIRS}"
++    )
++endif()
++
++
++option(PFP_USE_INTERNAL_LEVIOSAM "Build/fetch LevioSAM inside PFP" ON)
++
++if(PFP_USE_INTERNAL_LEVIOSAM)
++    if(TARGET lvsam)
++        message(STATUS "Using caller-provided LevioSAM target: lvsam")
++    else()
++        find_library(LEVIOSAM_LIB lvsam)
++        if(LEVIOSAM_LIB)
++            message(STATUS "Found external leviosam library: ${LEVIOSAM_LIB}")
++            add_library(lvsam INTERFACE IMPORTED)
++            set_target_properties(lvsam PROPERTIES
++                INTERFACE_LINK_LIBRARIES "${LEVIOSAM_LIB}"
++            )
++        else()
++            message(STATUS "leviosam library not found. Building as an external content.")
++            include(FetchContent)
++
++            FetchContent_Declare(
++                leviosam
++                GIT_REPOSITORY https://github.com/maxrossi91/levioSAM.git
++                GIT_TAG master
++            )
++
++            FetchContent_GetProperties(leviosam)
++            if(NOT leviosam_POPULATED)
++                FetchContent_Populate(leviosam)
++                set(BUILD_TESTS OFF CACHE BOOL "Avoid building LevioSAM tests")
++
++                add_subdirectory(${leviosam_SOURCE_DIR} ${leviosam_BINARY_DIR} EXCLUDE_FROM_ALL)
++                target_include_directories(lvsam PUBLIC ${leviosam_SOURCE_DIR}/src ${CMAKE_INCLUDE_PATH})
++
++                if(SDSL_LIB)
++                    target_link_libraries(lvsam INTERFACE htslib ${SDSL_LIB})
++                else()
++                    target_link_libraries(lvsam INTERFACE htslib)
++                endif()
++            endif()
++        endif()
++    endif()
++else()
++    message(STATUS "Skipping internal LevioSAM integration in PFP")
++    if(NOT TARGET lvsam)
++        add_library(lvsam INTERFACE)
+     endif()
+ endif()
+ ################################################################################
+@@ -119,7 +173,7 @@ target_link_libraries(pfp lvsam)
+ target_link_libraries(pfp64 lvsam)
+ target_compile_options(pfp64 PRIVATE "-DPFP_LONG_TYPE=ON")
+ 
+-set(VCF_LIB_DEPS ${HTSlib_LIBRARIES} ${ZLIB_LIBRARIES} dl pthread lvsam)# ssl crypto)
++set(VCF_LIB_DEPS htslib ${ZLIB_LIBRARIES} dl pthread lvsam)
+ 
+ ################################################################################
+ # Tests
