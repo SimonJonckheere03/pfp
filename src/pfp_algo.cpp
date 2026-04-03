@@ -9,6 +9,49 @@
 namespace
 {
 
+bool
+is_structural_sentinel(char c)
+{
+    return c == vcfbwt::pfp::DOLLAR || c == vcfbwt::pfp::DOLLAR_SEQUENCE || c == vcfbwt::pfp::DOLLAR_PRIME;
+}
+
+void
+write_bigbwt_payload_and_map(const std::string& full_text, const std::string& payload_path, const std::string& map_path)
+{
+    std::string payload;
+    payload.reserve(full_text.size());
+
+    std::vector<unsigned char> packed_bits((full_text.size() + 7) / 8, 0);
+    vcfbwt::long_type kept_count = 0;
+
+    for (std::size_t i = 0; i < full_text.size(); ++i)
+    {
+        if (is_structural_sentinel(full_text[i]))
+        {
+            continue;
+        }
+        payload.push_back(full_text[i]);
+        packed_bits[i / 8] |= static_cast<unsigned char>(1u << (i % 8));
+        ++kept_count;
+    }
+
+    std::ofstream payload_out(payload_path, std::ios::binary);
+    payload_out.write(payload.data(), payload.size());
+    vcfbwt::DiskWrites::update(payload_out.tellp());
+    payload_out.close();
+
+    std::ofstream map_out(map_path, std::ios::binary);
+    const vcfbwt::long_type full_length = full_text.size();
+    map_out.write(reinterpret_cast<const char*>(&full_length), sizeof(full_length));
+    map_out.write(reinterpret_cast<const char*>(&kept_count), sizeof(kept_count));
+    if (not packed_bits.empty())
+    {
+        map_out.write(reinterpret_cast<const char*>(packed_bits.data()), packed_bits.size());
+    }
+    vcfbwt::DiskWrites::update(map_out.tellp());
+    map_out.close();
+}
+
 std::string
 build_reference_segment_text(const std::string& reference, const vcfbwt::pfp::Params& params, bool first)
 {
@@ -47,6 +90,17 @@ build_sample_segment_text(const std::string& haplotype_sequence, const vcfbwt::p
     return segment;
 }
 
+size_t
+reference_payload_offset(const std::vector<vcfbwt::pfp::ReferenceParse>& references_parse, size_t ref_index)
+{
+    size_t offset = 0;
+    for (size_t i = 0; i < ref_index; ++i)
+    {
+        offset += references_parse[i].length();
+    }
+    return offset;
+}
+
 void
 parse_materialized_segment(const std::string& text, vcfbwt::pfp::Dictionary& dictionary, const vcfbwt::pfp::Params& params,
                            const std::set<vcfbwt::hash_type>& ignored_trigger_strings, std::vector<vcfbwt::hash_type>& parse)
@@ -64,6 +118,7 @@ parse_materialized_segment(const std::string& text, vcfbwt::pfp::Dictionary& dic
         if ((phrase.size() > params.w) and ((kr_hash.get_hash() % params.p) == 0))
         {
             std::string_view ts(&(phrase[phrase.size() - params.w]), params.w);
+            if (ts.find(vcfbwt::pfp::DOLLAR) != std::string_view::npos) { continue; }
             vcfbwt::hash_type ts_hash = vcfbwt::KarpRabinHash::string_hash(ts);
             if (ignored_trigger_strings.contains(ts_hash)) { continue; }
 
@@ -74,8 +129,8 @@ parse_materialized_segment(const std::string& text, vcfbwt::pfp::Dictionary& dic
         }
     }
 
-    if (phrase.size() >= params.w) { parse.push_back(dictionary.check_and_add(phrase)); }
-    else
+    if (phrase.size() > params.w) { parse.push_back(dictionary.check_and_add(phrase)); }
+    else if (phrase.size() < params.w)
     {
         spdlog::error("Materialized segment shorter than the parsing window at finalization");
         std::exit(EXIT_FAILURE);
@@ -451,11 +506,8 @@ vcfbwt::pfp::ParserVCF::operator()(const vcfbwt::Sample& sample)
         if(params.compute_lifting)
         {
             const size_t genotype = this->working_genotype;
-            // Include the last w characters at the end of each contig
-            size_t length = contig_iterator.length() + this->params.w;
-            if (contig.last(this->working_genotype)) length += this->params.w - 1;
             // Initialize the Lift builder
-            lift::Lift_builder lvs_builder(length);
+            lift::Lift_builder lvs_builder(contig.get_reference().size());
             // Iterate throgh all the variations
             for(size_t i = 0; i < contig.variations.size(); ++i)
             {
@@ -472,7 +524,7 @@ vcfbwt::pfp::ParserVCF::operator()(const vcfbwt::Sample& sample)
             }
 
             lift::Lift lift(lvs_builder);
-            size_t offset = contig.offset();
+            size_t offset = reference_payload_offset(*references_parse, ref_index);
             out_lift.write((char *)&offset, sizeof(offset)); 
             lift.serialize(out_lift);
         }
@@ -480,10 +532,7 @@ vcfbwt::pfp::ParserVCF::operator()(const vcfbwt::Sample& sample)
         // Reporting contig lengths
         if(params.report_lengths or params.compute_lifting)
         {
-            // Include the last w characters at the end of each contig
-            size_t length = contig_iterator.length() + this->params.w;
-            if (contig.last(this->working_genotype))
-                length += this->params.w - 1;
+            const size_t length = contig_iterator.length();
             const std::string contig_name = sample.id() + "_H" + std::to_string(this->working_genotype + 1) + "_" + contig.id();
             out_len << contig_name << " " << length << std::endl;
         }
@@ -622,14 +671,12 @@ vcfbwt::pfp::ParserVCF::close()
                 merged.write((char*) &out_e, sizeof(size_type));
             }
         }
-        size_t n_contigs = 0;
         // Main
         if ((this->parse_size) != 0)
         {
             std::ifstream main_parse(this->tmp_out_file_name);
             merged << main_parse.rdbuf();
             out_parse_size += this->parse_size;
-            n_contigs += this->contigs_processed.size();
         }
         
         // Workers
@@ -640,7 +687,6 @@ vcfbwt::pfp::ParserVCF::close()
                 out_parse_size += worker.get().parse_size;
                 std::ifstream worker_parse(worker.get().tmp_out_file_name);
                 merged << worker_parse.rdbuf();
-                n_contigs += worker.get().contigs_processed.size();
             }
         }
         vcfbwt::DiskWrites::update(merged.tellp()); // Disk Stats
@@ -654,8 +700,7 @@ vcfbwt::pfp::ParserVCF::close()
             // Reference
             for(auto& reference_parse : *(this->references_parse))
             {
-                // Include the last w characters at the end of each contig
-                const size_t length = reference_parse.length() + this->params.w;
+                const size_t length = reference_parse.length();
                 const std::string contig_name = reference_parse.id();
                 merged << contig_name << " " << length << std::endl;
             }
@@ -719,8 +764,6 @@ vcfbwt::pfp::ParserVCF::close()
                 builder.set(idx);
 
             sdsl::sd_vector<> starts(builder);
-            sdsl::sd_vector<>::rank_1_type rank1(&starts);
-            sdsl::sd_vector<>::select_1_type select1(&starts);
             // Writing the seqidx on disk
             merged.write((char *)&u, sizeof(u));
             merged.write((char *)&w, sizeof(w));
@@ -733,9 +776,8 @@ vcfbwt::pfp::ParserVCF::close()
                 merged.write((char *)names[i].data(), names[i].size());
             }
 
-            n_contigs += this->references_parse->size();
-            // Write the total number of contigs
-            merged.write((char *)&n_contigs, sizeof(n_contigs));
+            const size_t reference_count = this->references_parse->size();
+            merged.write((char *)&reference_count, sizeof(reference_count));
 
             // Build the empty liftings for the references
             size_t clen = 0;
@@ -885,8 +927,40 @@ vcfbwt::pfp::ParserVCF::close()
         }
         merged_parse_stream.close();
         forward_text.append(this->params.w, DOLLAR);
+        if (forward_text.size() < (this->params.w + 1))
+        {
+            spdlog::error("Forward text is too short to build the reverse parse");
+            std::exit(EXIT_FAILURE);
+        }
+        if (forward_text.front() != DOLLAR)
+        {
+            spdlog::error("Forward text does not start with the expected leading dollar");
+            std::exit(EXIT_FAILURE);
+        }
+        for (std::size_t i = 0; i < this->params.w; ++i)
+        {
+            if (forward_text[forward_text.size() - this->params.w + i] != DOLLAR)
+            {
+                spdlog::error("Forward text does not end with {} trailing dollars", this->params.w);
+                std::exit(EXIT_FAILURE);
+            }
+        }
 
-        std::string reverse_text(forward_text.rbegin(), forward_text.rend());
+        std::string reverse_text;
+        reverse_text.reserve(forward_text.size());
+        reverse_text.push_back(DOLLAR);
+        reverse_text.append(forward_text.rbegin() + this->params.w, forward_text.rend() - 1);
+        reverse_text.append(this->params.w, DOLLAR);
+
+        write_bigbwt_payload_and_map(
+            forward_text,
+            out_file_prefix + EXT::BIG_BWT_PAYLOAD,
+            out_file_prefix + EXT::BIG_BWT_MAP);
+        write_bigbwt_payload_and_map(
+            reverse_text,
+            out_file_prefix + ".rev" + EXT::BIG_BWT_PAYLOAD,
+            out_file_prefix + ".rev" + EXT::BIG_BWT_MAP);
+
         parse_materialized_segment(reverse_text, *this->dictionary_rev, this->params, ignored_trigger_strings_rev, reverse_parse_hashes);
         this->parse_size_rev = reverse_parse_hashes.size();
 
@@ -1214,8 +1288,7 @@ vcfbwt::pfp::ParserFasta::close()
         // Reference
         for(int i = 0; i < this->references.size(); i++)
         {
-            // Include the last w characters at the end of each contig
-            const size_t length = this->references[i].size() + this->params.w;
+            const size_t length = this->references[i].size();
             const std::string contig_name = this->references_name[i];
             merged << contig_name << " " << length << std::endl;
         }
@@ -1260,8 +1333,6 @@ vcfbwt::pfp::ParserFasta::close()
             builder.set(idx);
 
         sdsl::sd_vector<> starts(builder);
-        sdsl::sd_vector<>::rank_1_type rank1(&starts);
-        sdsl::sd_vector<>::select_1_type select1(&starts);
         // Writing the seqidx on disk
         merged.write((char *)&u, sizeof(u));
         merged.write((char *)&w, sizeof(w));
@@ -1274,10 +1345,8 @@ vcfbwt::pfp::ParserFasta::close()
             merged.write((char *)names[i].data(), names[i].size());
         }
 
-        size_t n_contigs = 0;
-        n_contigs += this->references.size();
-        // Write the total number of contigs
-        merged.write((char *)&n_contigs, sizeof(n_contigs));
+        const size_t reference_count = this->references.size();
+        merged.write((char *)&reference_count, sizeof(reference_count));
 
         // Build the empty liftings for the references
         size_t clen = 0;
