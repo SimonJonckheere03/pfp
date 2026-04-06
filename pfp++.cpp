@@ -39,6 +39,8 @@ int main(int argc, char **argv)
     app.add_option("-o,--out-prefix", out_prefix, "Output prefix")->configurable();
     app.add_option("-m, --max", max_samples, "Max number of samples to analyze")->configurable();
     app.add_option("-S, --samples", samples_file_name, "File containing the list of samples to parse")->configurable();
+    app.add_option("-P, --name-prefix", params.haplotype_name_prefix, "Prefix added to generated haplotype sequence names")->configurable();
+    app.add_option("--seed-length", params.seed_length, "Seed length used for Columba-compatible non-ACGT replacement")->configurable();
     app.add_option("-w, --window-size", params.w, "Sliding window size")->check(CLI::Range(3, 200))->configurable();
     app.add_option("-p, --modulo", params.p, "Module used during parisng")->check(CLI::Range(5, 20000))->configurable();
     app.add_option("-j, --threads", threads, "Number of threads")->configurable();

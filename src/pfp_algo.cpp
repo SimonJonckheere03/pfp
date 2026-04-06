@@ -5,6 +5,8 @@
 //
 
 #include <pfp_algo.hpp>
+#include <cctype>
+#include <random>
 
 namespace
 {
@@ -13,6 +15,72 @@ bool
 is_structural_sentinel(char c)
 {
     return c == vcfbwt::pfp::DOLLAR || c == vcfbwt::pfp::DOLLAR_SEQUENCE || c == vcfbwt::pfp::DOLLAR_PRIME;
+}
+
+char
+replace_non_acgt(char original, std::minstd_rand& gen)
+{
+    static constexpr char valid_chars[] = {'A', 'C', 'G', 'T'};
+    if (original != 'A' && original != 'C' && original != 'G' && original != 'T')
+    {
+        std::uniform_int_distribution<std::size_t> distribution(0, 3);
+        return valid_chars[distribution(gen)];
+    }
+    return original;
+}
+
+char
+replace_non_acgt_with_seed(char original, const std::string& seed, std::size_t& seed_index)
+{
+    if (original != 'A' && original != 'C' && original != 'G' && original != 'T')
+    {
+        char replacement = seed[seed_index];
+        seed_index = (seed_index + 1) % seed.size();
+        return replacement;
+    }
+    seed_index = 0;
+    return original;
+}
+
+std::string
+normalize_biological_sequence(const std::string& sequence, const vcfbwt::pfp::Params& params)
+{
+    if (not params.acgt_only)
+    {
+        return sequence;
+    }
+
+    std::string normalized;
+    normalized.reserve(sequence.size());
+
+    std::minstd_rand gen(42);
+    std::string seed;
+    if (params.seed_length > 0)
+    {
+        seed.reserve(params.seed_length);
+        for (std::size_t i = 0; i < params.seed_length; ++i)
+        {
+            seed.push_back(replace_non_acgt('N', gen));
+        }
+        gen.seed(42);
+    }
+
+    std::size_t seed_index = 0;
+    for (char c : sequence)
+    {
+        char normalized_char = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        if (params.seed_length == 0)
+        {
+            normalized_char = replace_non_acgt(normalized_char, gen);
+        }
+        else
+        {
+            normalized_char = replace_non_acgt_with_seed(normalized_char, seed, seed_index);
+        }
+        normalized.push_back(normalized_char);
+    }
+
+    return normalized;
 }
 
 void
@@ -65,11 +133,7 @@ build_reference_segment_text(const std::string& reference, const vcfbwt::pfp::Pa
         segment.push_back(vcfbwt::pfp::DOLLAR_SEQUENCE);
     }
 
-    for (char c : reference)
-    {
-        if (params.acgt_only) { c = vcfbwt::pfp::acgt_only_table[static_cast<unsigned char>(c)]; }
-        segment.push_back(c);
-    }
+    segment.append(reference);
 
     segment.append(params.w - 1, vcfbwt::pfp::DOLLAR_PRIME);
     segment.push_back(vcfbwt::pfp::DOLLAR_SEQUENCE);
@@ -279,7 +343,8 @@ vcfbwt::pfp::ReferenceParse::init(const std::string& reference, bool first)
         spdlog::info("To be ingored trigger strings: {}", this->to_ignore_ts_hash.size());
     }
 
-    this->segment_text = build_reference_segment_text(reference, this->params, first);
+    const std::string biological_reference = normalize_biological_sequence(reference, this->params);
+    this->segment_text = build_reference_segment_text(biological_reference, this->params, first);
     
     std::string phrase;
     spdlog::info("Parsing reference contig " + this->ref_id);
@@ -297,12 +362,9 @@ vcfbwt::pfp::ReferenceParse::init(const std::string& reference, bool first)
         kr_hash.initialize(phrase);    
     }
     
-    for (std::size_t ref_it = 0; ref_it < reference.size(); ref_it++)
+    for (std::size_t ref_it = 0; ref_it < biological_reference.size(); ref_it++)
     {
-        char c = reference[ref_it];
-
-        if (params.acgt_only) c = acgt_only_table[static_cast<unsigned char>(c)];
-        
+        char c = biological_reference[ref_it];
         phrase.push_back(c);
         if (phrase.size() == params.w) { kr_hash.initialize(phrase); }
         else if (phrase.size() > params.w) { kr_hash.update(phrase[phrase.size() - params.w - 1], phrase[phrase.size() - 1]); }
@@ -334,7 +396,7 @@ vcfbwt::pfp::ReferenceParse::init(const std::string& reference, bool first)
         hash_type hash = dictionary.check_and_add(phrase);
     
         this->parse.push_back(hash);
-        this->trigger_strings_position.push_back(reference.size() - 1);
+        this->trigger_strings_position.push_back(biological_reference.size() - 1);
     }
     else { spdlog::error("The reference doesn't have w dollar prime at the end!"); std::exit(EXIT_FAILURE); }
 }
@@ -399,108 +461,131 @@ vcfbwt::pfp::ParserVCF::operator()(const vcfbwt::Sample& sample)
             haplotype_sequence.push_back(*segment_iterator);
             ++segment_iterator;
         }
-        this->reverse_segments.push_back({build_sample_segment_text(haplotype_sequence, this->params, contig.last(this->working_genotype)),
-                                          &reference_parse.to_ignore_ts_hash});
-
-        // Karp Robin Hash Function for sliding window
-        KarpRabinHash kr_hash(this->params.w);
-        std::string phrase;
-        // Every contig starts with w-1 dollar prime and one dollar seq
-        phrase.append(this->w - 1, DOLLAR_PRIME);
-        phrase.append(1, DOLLAR_SEQUENCE);
-        kr_hash.initialize(phrase);
-
-        std::size_t start_window = 0, end_window = 0;
-
-        Contig::iterator contig_iterator(contig, this->working_genotype);
-
-        while (not contig_iterator.end())
+        if (this->params.acgt_only)
         {
-            // Compute where we are on the reference
-            std::size_t pos_on_reference = contig_iterator.get_ref_it();
-            
-            if ( not ((contig_iterator.get_var_it() > 0) and (contig_iterator.prev_variation() > (pos_on_reference - (8 * this->w)))))
+            std::string normalized_haplotype_sequence = normalize_biological_sequence(haplotype_sequence, this->params);
+            std::string segment_text = build_sample_segment_text(normalized_haplotype_sequence, this->params,
+                                                                 contig.last(this->working_genotype));
+
+            std::vector<hash_type> materialized_parse;
+            parse_materialized_segment(segment_text, *this->dictionary, this->params,
+                                       reference_parse.to_ignore_ts_hash, materialized_parse);
+
+            if (not materialized_parse.empty())
             {
-                // Set start postion to the position in the reference parse after the last computed phrase
-                if (params.use_acceleration and ((phrase.size() == this->w) and ((pos_on_reference != 0) and (phrase[0] != DOLLAR_PRIME))))
-                {
-                    start_window = end_window;
-                    while ((tsp[start_window] + this->w) <= pos_on_reference and (start_window < tsp.size() - 2))
-                    { start_window++; }
-        
-                    // Iterate over the parse up to the next variation
-                    while (tsp[end_window + 1] < (long long int)(contig_iterator.next_variation() - (this->w + 1))) { end_window++; }
-                    
-                    // If the window is not empty
-                    if ((start_window < end_window - 1) and (tsp[end_window] > pos_on_reference))
-                    {
-                        spdlog::debug("------------------------------------------------------------");
-                        spdlog::debug("copied from {} to {}", tsp[start_window], tsp[end_window] + this->w);
-                        spdlog::debug("next variation: {}", contig_iterator.next_variation());
-                        spdlog::debug("skipped phrases: {}", end_window - start_window);
-                        
-                        // copy from parse[start_window : end_window]
-                        out_file.write((char*) &(reference_parse.parse[start_window]), sizeof(hash_type) * (end_window - start_window + 1));
-                        this->parse_size += end_window - start_window + 1;
+                out_file.write(reinterpret_cast<char*>(materialized_parse.data()),
+                               sizeof(hash_type) * materialized_parse.size());
+                this->parse_size += materialized_parse.size();
+            }
+
+            this->reverse_segments.push_back({std::move(segment_text), &reference_parse.to_ignore_ts_hash});
+        }
+        else
+        {
+            this->reverse_segments.push_back({build_sample_segment_text(haplotype_sequence, this->params,
+                                                                        contig.last(this->working_genotype)),
+                                              &reference_parse.to_ignore_ts_hash});
+
+            // Karp Robin Hash Function for sliding window
+            KarpRabinHash kr_hash(this->params.w);
+            std::string phrase;
+            // Every contig starts with w-1 dollar prime and one dollar seq
+            phrase.append(this->w - 1, DOLLAR_PRIME);
+            phrase.append(1, DOLLAR_SEQUENCE);
+            kr_hash.initialize(phrase);
+
+            std::size_t start_window = 0, end_window = 0;
+
+            Contig::iterator contig_iterator(contig, this->working_genotype);
+
+            while (not contig_iterator.end())
+            {
+                // Compute where we are on the reference
+                std::size_t pos_on_reference = contig_iterator.get_ref_it();
                 
-                        // move iterators and re initialize phrase
-                        contig_iterator.go_to(tsp[end_window]);
-                        phrase.clear();
-                        for (std::size_t i = 0; i < this->w; i++) { ++contig_iterator; phrase.push_back(*contig_iterator);}
+                if ( not ((contig_iterator.get_var_it() > 0) and (contig_iterator.prev_variation() > (pos_on_reference - (8 * this->w)))))
+                {
+                    // Set start postion to the position in the reference parse after the last computed phrase
+                    if (params.use_acceleration and ((phrase.size() == this->w) and ((pos_on_reference != 0) and (phrase[0] != DOLLAR_PRIME))))
+                    {
+                        start_window = end_window;
+                        while ((tsp[start_window] + this->w) <= pos_on_reference and (start_window < tsp.size() - 2))
+                        { start_window++; }
+            
+                        // Iterate over the parse up to the next variation
+                        while (tsp[end_window + 1] < (long long int)(contig_iterator.next_variation() - (this->w + 1))) { end_window++; }
                         
-                        kr_hash.reset(); kr_hash.initialize(phrase);
-                        
-                        ++contig_iterator;
-                        spdlog::debug("New phrase [{}]: {}", phrase.size(), phrase);
-                        spdlog::debug("------------------------------------------------------------");
+                        // If the window is not empty
+                        if ((start_window < end_window - 1) and (tsp[end_window] > pos_on_reference))
+                        {
+                            spdlog::debug("------------------------------------------------------------");
+                            spdlog::debug("copied from {} to {}", tsp[start_window], tsp[end_window] + this->w);
+                            spdlog::debug("next variation: {}", contig_iterator.next_variation());
+                            spdlog::debug("skipped phrases: {}", end_window - start_window);
+                            
+                            // copy from parse[start_window : end_window]
+                            out_file.write((char*) &(reference_parse.parse[start_window]), sizeof(hash_type) * (end_window - start_window + 1));
+                            this->parse_size += end_window - start_window + 1;
+                    
+                            // move iterators and re initialize phrase
+                            contig_iterator.go_to(tsp[end_window]);
+                            phrase.clear();
+                            for (std::size_t i = 0; i < this->w; i++) { ++contig_iterator; phrase.push_back(*contig_iterator);}
+                            
+                            kr_hash.reset(); kr_hash.initialize(phrase);
+                            
+                            ++contig_iterator;
+                            spdlog::debug("New phrase [{}]: {}", phrase.size(), phrase);
+                            spdlog::debug("------------------------------------------------------------");
+                        }
                     }
                 }
-            }
+
+                // Next phrase should contain a variation so parse as normal, also if we don't
+                // want to use the acceleration we should always end up here
+                phrase.push_back(*contig_iterator);
+                kr_hash.update(phrase[phrase.size() - params.w - 1], phrase[phrase.size() - 1]);
+                ++contig_iterator;
             
-            // Next phrase should contain a variation so parse as normal, also if we don't
-            // want to use the acceleration we should always end up here
-            phrase.push_back(*contig_iterator);
-            kr_hash.update(phrase[phrase.size() - params.w - 1], phrase[phrase.size() - 1]);
-            ++contig_iterator;
-        
-            if ((phrase.size() > this->params.w) and ((kr_hash.get_hash() % this->params.p) == 0))
-            {
-                std::string_view ts(&(phrase[phrase.size() - params.w]), params.w);
-                hash_type ts_hash = KarpRabinHash::string_hash(ts);
-                if (reference_parse.to_ignore_ts_hash.contains(ts_hash)) { continue; }
-                
-                hash_type hash = this->dictionary->check_and_add(phrase);
-            
-                out_file.write((char*) (&hash), sizeof(hash_type)); this->parse_size += 1;
-        
-                if (phrase[0] != DOLLAR_PRIME)
+                if ((phrase.size() > this->params.w) and ((kr_hash.get_hash() % this->params.p) == 0))
                 {
-                    spdlog::debug("------------------------------------------------------------");
-                    spdlog::debug("Parsed phrase [{}] {}", phrase.size(), phrase);
-                    spdlog::debug("------------------------------------------------------------");
-                }
+                    std::string_view ts(&(phrase[phrase.size() - params.w]), params.w);
+                    hash_type ts_hash = KarpRabinHash::string_hash(ts);
+                    if (reference_parse.to_ignore_ts_hash.contains(ts_hash)) { continue; }
+                    
+                    hash_type hash = this->dictionary->check_and_add(phrase);
                 
-                phrase.erase(phrase.begin(), phrase.end() - this->w); // Keep the last w chars
-        
-                kr_hash.reset(); kr_hash.initialize(phrase);
-            }
-        }
-
-        assert(contig_iterator.length() == (contig_iterator.get_sam_it() - 1)); // -1 because of the last voi itration
-
-        // Last phrase
-        if (phrase.size() >= this->w)
-        {
-            // Append w dollar prime at the end of each sample, also w DOLLAR if it's the last sample
-            phrase.append(this->w - 1, DOLLAR_PRIME);
-            if (contig.last(this->working_genotype)) { phrase.append(this->w, DOLLAR); }
-            else { phrase.append(1, DOLLAR_SEQUENCE); }
-
-            hash_type hash = this->dictionary->check_and_add(phrase);
+                    out_file.write((char*) (&hash), sizeof(hash_type)); this->parse_size += 1;
             
-            out_file.write((char*) (&hash), sizeof(hash_type));   this->parse_size += 1;
+                    if (phrase[0] != DOLLAR_PRIME)
+                    {
+                        spdlog::debug("------------------------------------------------------------");
+                        spdlog::debug("Parsed phrase [{}] {}", phrase.size(), phrase);
+                        spdlog::debug("------------------------------------------------------------");
+                    }
+                    
+                    phrase.erase(phrase.begin(), phrase.end() - this->w); // Keep the last w chars
+            
+                    kr_hash.reset(); kr_hash.initialize(phrase);
+                }
+            }
+
+            assert(contig_iterator.length() == (contig_iterator.get_sam_it() - 1)); // -1 because of the last voi itration
+
+            // Last phrase
+            if (phrase.size() >= this->w)
+            {
+                // Append w dollar prime at the end of each sample, also w DOLLAR if it's the last sample
+                phrase.append(this->w - 1, DOLLAR_PRIME);
+                if (contig.last(this->working_genotype)) { phrase.append(this->w, DOLLAR); }
+                else { phrase.append(1, DOLLAR_SEQUENCE); }
+
+                hash_type hash = this->dictionary->check_and_add(phrase);
+                
+                out_file.write((char*) (&hash), sizeof(hash_type));   this->parse_size += 1;
+            }
+            else { spdlog::error("A sample doesn't have w dollar prime at the end!"); std::exit(EXIT_FAILURE); }
         }
-        else { spdlog::error("A sample doesn't have w dollar prime at the end!"); std::exit(EXIT_FAILURE); }
 
         // Build the lifting
         if(params.compute_lifting)
@@ -532,8 +617,8 @@ vcfbwt::pfp::ParserVCF::operator()(const vcfbwt::Sample& sample)
         // Reporting contig lengths
         if(params.report_lengths or params.compute_lifting)
         {
-            const size_t length = contig_iterator.length();
-            const std::string contig_name = sample.id() + "_H" + std::to_string(this->working_genotype + 1) + "_" + contig.id();
+            const size_t length = haplotype_sequence.size();
+            const std::string contig_name = params.haplotype_name_prefix + sample.id() + "_H" + std::to_string(this->working_genotype + 1) + "_" + contig.id();
             out_len << contig_name << " " << length << std::endl;
         }
     }

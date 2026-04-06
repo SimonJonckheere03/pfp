@@ -12,6 +12,7 @@
 #include <set>
 #include <iostream>
 #include <fstream>
+#include <cstddef>
 #include <vcf.hpp>
 #include <utils.hpp>
 #include <internals.hpp>
@@ -102,6 +103,7 @@ struct Params
 {
     hash_type p = 100;
     hash_type w =  10;
+    std::size_t seed_length = 100;
     bool compress_dictionary = false;
     bool use_acceleration = false;
     bool print_out_statistics_csv = false;
@@ -111,6 +113,7 @@ struct Params
     bool report_lengths = false;
     bool acgt_only = false;
     std::string ignore_ts_file;
+    std::string haplotype_name_prefix;
 };
 
 struct Statistics
