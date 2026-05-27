@@ -176,7 +176,6 @@ private:
     
     struct ReverseSegment
     {
-        std::string text;
         const std::set<hash_type>* ignored_trigger_strings = nullptr;
     };
 

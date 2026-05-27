@@ -478,13 +478,11 @@ vcfbwt::pfp::ParserVCF::operator()(const vcfbwt::Sample& sample)
                 this->parse_size += materialized_parse.size();
             }
 
-            this->reverse_segments.push_back({std::move(segment_text), &reference_parse.to_ignore_ts_hash});
+            this->reverse_segments.push_back({&reference_parse.to_ignore_ts_hash});
         }
         else
         {
-            this->reverse_segments.push_back({build_sample_segment_text(haplotype_sequence, this->params,
-                                                                        contig.last(this->working_genotype)),
-                                              &reference_parse.to_ignore_ts_hash});
+            this->reverse_segments.push_back({&reference_parse.to_ignore_ts_hash});
 
             // Karp Robin Hash Function for sliding window
             KarpRabinHash kr_hash(this->params.w);
